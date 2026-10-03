@@ -7515,3 +7515,741 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ===========================================================================
+# SIDE ROLL (cartwheel / lateral roll) — the roulade rotated onto the x-axis
+# ===========================================================================
+#
+# A side roll turns the duck over its shoulder: rotation about the body's
+# FORWARD (x) axis, the mirror of the roulade (which rolls forward about the
+# body's LATERAL (y) axis). The accumulator / progress / landing machinery is
+# identical — only three things flip:
+#   1. ROTATION AXIS: body-frame ω_x (ang_vel_b[:, 0]) instead of ω_y.
+#   2. FLATNESS GATE: keep the body's FORWARD (x) axis horizontal (world-z ≈ 0)
+#      so a clean lateral roll counts and a sagittal/forward tumble doesn't
+#      (the roulade instead keeps its LATERAL axis horizontal).
+#   3. OVER-THE-SIDE LATCH: |lateral_axis_z| near 1 at mid-roll (the duck is
+#      lying on its side — that is the cartwheel pivot) in place of the
+#      head-on-floor latch. A forward-roll never reaches it (lateral axis stays
+#      horizontal the whole way), so it cannot fake a completion.
+#
+# Handedness is _SIDEROLL_SIGN; the symmetric double-flip (left AND right) is
+# produced by the symmetry mirror loss (the task is left-right symmetric).
+
+# Forward-roll sign for the side roll. Positive ω_x (ang_vel_b[:,0]) tips the
+# duck toward one shoulder; the mirror provides the other hand. Empirically
+# fixed in the smoke test like the roulade's _ROULADE_FWD_SIGN.
+_SIDEROLL_SIGN = 1.0
+
+# Support + side-latch sensor names (must match the env cfg).
+_SIDEROLL_SUPPORT_SENSOR = "robot_ground_contact"
+
+# Side latch: |lateral_axis_z| above this while accum is inside the first
+# quadrant marks a genuine over-the-side roll (the duck is on its side = the
+# cartwheel pivot). A clean side roll crosses ~1.0 at the 90° mark; a forward
+# tumble keeps |lateral_axis_z| ≈ 0 throughout (lateral axis stays horizontal),
+# so it can never open the landing gate.
+_SIDEROLL_LAT_THRESH = 0.8
+
+# Side flatness gate thresholds (reuse the roulade angles, in radians of
+# |forward_axis_z|): full rotation credit while the forward axis is within
+# ~30° of horizontal, zero beyond ~60°.
+_SIDEROLL_FLAT_FULL = 0.5
+_SIDEROLL_FLAT_ZERO = 0.866
+
+
+class SideRollCommand(UniformVelocityCommand):
+    """Two-button side-roll command: cmd = [0, roll_btn, 0].
+
+    roll_btn ∈ {−1.0, +1.0} — ONE BUTTON PER HAND (left roll / right roll).
+    The start posture is NOT commanded: the policy reads it off the
+    proprioception (standing HOME vs the sit keyframe differ by >0.4 rad on
+    the knees) and rolls back INTO it (stand → roll → stand, sit → roll →
+    sit). The landing reward targets come from the spawn bucket, not from
+    this command.
+
+    The button lives in the vy slot (obs[49]) deliberately: the symmetry
+    mirror table NEGATES that slot, so the mirror loss ties the two hands
+    together (mirror of "roll left" IS "roll right"). Putting the button in
+    a non-negated slot would push the mirror loss toward symmetric actions
+    that can't initiate a roll in either direction.
+
+    ``reset_side_roll_state`` samples the button and stores it in
+    ``env._side_roll_spawn_cmd``; ``compute()`` forces it onto
+    ``vel_command_b`` on the first step after reset (mjlab resets events
+    BEFORE the command manager, so a direct write from the event would be
+    clobbered by the command's own resample — same ordering SitStandCommand
+    works around for its alpha).
+
+    Deployment: the runtime writes [0, ±1, 0] into the twist slot — button
+    left = −1, button right = +1 (the convention is fixed by _SIDEROLL_SIGN).
+    ALWAYS write an explicit ±1: the command resampler only ever samples ±1,
+    so vy=0 is out of distribution and the roll is unreliable there (measured
+    in duck3d 2026-10-04: idle [0,0,0] stalls, [0,1,0] rolls). The ≥0→+1
+    coercion in _side_roll_direction is a safety fallback, not a license to
+    feed zeros.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._env_ref = env
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self.vel_command_b
+
+    def compute(self, dt: float) -> None:
+        super().compute(dt)
+        # Force the spawn-consistent command stored by reset_side_roll_state.
+        # Runs before the post-reset observation is computed (env.reset calls
+        # command_manager.compute(0.0) after the resets), so the policy never
+        # sees a command that disagrees with its spawn.
+        fresh = self._env_ref.episode_length_buf <= 1
+        spawn_cmd = getattr(self._env_ref, "_side_roll_spawn_cmd", None)
+        if spawn_cmd is not None and fresh.any():
+            self.vel_command_b[fresh] = spawn_cmd[fresh]
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        n = len(env_ids)
+        if n == 0:
+            return
+        btn = torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0)
+        self.vel_command_b[env_ids] = 0.0
+        self.vel_command_b[env_ids, 1] = btn
+
+    def _update_command(self) -> None:
+        pass  # No heading controller / standing-env machinery.
+
+    def _update_metrics(self) -> None:
+        pass  # No velocity-tracking metrics for flag commands.
+
+
+@_dataclass(kw_only=True)
+class SideRollCommandCfg(UniformVelocityCommandCfg):
+    class_type: type = SideRollCommand
+
+    def build(self, env: ManagerBasedRlEnv) -> "SideRollCommand":
+        return SideRollCommand(self, env)
+
+
+def _side_roll_direction(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Commanded roll hand per env, coerced to ±1 (never 0).
+
+    The coercion is a safety fallback only — vy=0 is UNTRAINED (the command
+    resampler samples ±1 exclusively); the runtime must always write an
+    explicit ±1 button (see SideRollCommand's deployment note).
+    """
+    cmd = env.command_manager.get_command("twist")
+    return torch.where(cmd[:, 1] >= 0.0, 1.0, -1.0)
+
+
+def _side_roll_posture(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env LANDING posture from the spawn: 0.0 = STAND, 1.0 = SIT.
+
+    Written by reset_side_roll_state (stand bucket → 0, seated → 1, mid-roll
+    → a 50/50 deterministic sample — the stand-target half keeps the
+    crouch→stand bootstrap alive)."""
+    if not hasattr(env, "_side_roll_posture"):
+        env._side_roll_posture = torch.zeros(env.num_envs, device=env.device)
+    return env._side_roll_posture
+
+
+def _posture_pick(
+    posture: torch.Tensor, stand_val: torch.Tensor, sit_val: torch.Tensor
+) -> torch.Tensor:
+    """Per-env select: STAND envs get stand_val, SIT envs get sit_val. The
+    0.5 = EITHER branch (element-wise max) is kept only for backward
+    compatibility; reset_side_roll_state no longer writes it (it neutralized
+    the rise-from-crouch pressure — see the reset docstring)."""
+    return torch.where(
+        posture < 0.25,
+        stand_val,
+        torch.where(posture > 0.75, sit_val, torch.maximum(stand_val, sit_val)),
+    )
+
+
+def _forward_axis_z(quat: torch.Tensor) -> torch.Tensor:
+    """World-z component of the body's forward (x) axis. 0 = forward-axis horizontal."""
+    # R[2,0] = 2*(x*z - y*w); quat cols (w,x,y,z) → [0,1,2,3].
+    return 2.0 * (quat[:, 1] * quat[:, 3] - quat[:, 0] * quat[:, 2])
+
+
+def _side_roll_state(env: ManagerBasedRlEnv) -> tuple:
+    if not hasattr(env, "_side_roll_accum"):
+        z = torch.zeros(env.num_envs, device=env.device)
+        env._side_roll_accum = z.clone()
+        env._side_roll_max = z.clone()
+        env._side_roll_paid = z.clone()
+        env._side_roll_side_latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._side_roll_last_update_step = -1
+    return env._side_roll_accum, env._side_roll_max, env._side_roll_paid
+
+
+def _update_side_roll_accum(env: ManagerBasedRlEnv, asset: Entity) -> None:
+    """Integrate body-frame ω_x (roll about the forward axis) into the frontier.
+
+    Step-guarded (multiple reward terms read it in one control step). SUPPORT
+    GATE: only while some robot geom touches the terrain (a cartwheel is
+    supported — airborne rotation earns nothing and never opens the gate).
+    FLATNESS GATE: forward-axis world-z must be small (≈ horizontal) so a
+    clean lateral roll counts and a forward/sagittal tumble doesn't. LATCHES
+    env._side_roll_side_latch when |lateral_axis_z| crosses the threshold in the
+    first-quadrant window — "over the side" is a hard requirement for the
+    landing annuity, exactly as the roulade's head-top latch.
+    """
+    _side_roll_state(env)
+    step = int(env.common_step_counter)
+    if step != env._side_roll_last_update_step:
+        # Progress is signed by the COMMANDED button: rotating WITH roll_btn
+        # accumulates positive progress in both hands, so one frontier
+        # threshold set serves left and right rolls (and the mirror loss keeps
+        # the two consistent).
+        direction = _side_roll_direction(env)
+        omega_x = direction * _SIDEROLL_SIGN * asset.data.root_link_ang_vel_b[:, 0]
+        delta = torch.nan_to_num(omega_x, nan=0.0) * env.step_dt
+        supported = _sensor_any_contact(env, _SIDEROLL_SUPPORT_SENSOR)
+        if supported is not None:
+            delta = delta * supported.float()
+        # Flatness gate: keep the FORWARD (x) axis horizontal (world-z ≈ 0).
+        x_z = torch.nan_to_num(_forward_axis_z(asset.data.root_link_quat_w), nan=1.0).abs()
+        t = torch.clamp((_SIDEROLL_FLAT_ZERO - x_z) / (_SIDEROLL_FLAT_ZERO - _SIDEROLL_FLAT_FULL), 0.0, 1.0)
+        delta = delta * (t * t * (3.0 - 2.0 * t))
+        env._side_roll_accum = env._side_roll_accum + delta
+        env._side_roll_max = torch.maximum(env._side_roll_max, env._side_roll_accum)
+
+        # Side latch: the duck is on its side (lateral axis near-vertical) while
+        # accum is in the first-quadrant window.
+        lat_z = torch.nan_to_num(_lateral_axis_z(asset.data.root_link_quat_w), nan=0.0).abs()
+        in_window = (env._side_roll_accum > _HEAD_LATCH_LO) & (
+            env._side_roll_accum < _HEAD_LATCH_HI
+        )
+        env._side_roll_side_latch = env._side_roll_side_latch | (
+            (lat_z > _SIDEROLL_LAT_THRESH) & in_window
+        )
+        env._side_roll_last_update_step = step
+
+
+def _side_roll_completion_gate(
+    env: ManagerBasedRlEnv,
+    gate_lo: float,
+    gate_hi: float,
+    require_side: bool = False,
+) -> torch.Tensor:
+    """Smoothstep on the side-roll progress frontier (0 below gate_lo, 1 above gate_hi)."""
+    _, max_accum, _ = _side_roll_state(env)
+    t = torch.clamp((max_accum - gate_lo) / max(gate_hi - gate_lo, 1e-6), 0.0, 1.0)
+    gate = t * t * (3.0 - 2.0 * t)
+    if require_side:
+        gate = gate * env._side_roll_side_latch.float()
+    return gate
+
+
+def reset_side_roll_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    standing_prob: float = 0.35,
+    seated_prob: float = 0.30,
+    midroll_prob: float = 0.35,
+    standing_z_min: float = 0.11,
+    standing_z_max: float = 0.12,
+    standing_tilt_max: float = 0.0,
+    crouch_start_prob: float = 0.0,
+    sitting_z_min: float = 0.06,
+    sitting_z_max: float = 0.075,
+    sitting_tilt_max: float = math.radians(8.0),
+    sitting_joint_overrides: Optional[dict] = None,
+    sitting_joint_noise_std: float = 0.10,
+    forward_vel_range: tuple = (0.0, 0.0),
+    midroll_pitch_min: float = math.radians(50.0),
+    midroll_pitch_max: float = math.radians(340.0),
+    midroll_z_min: float = 0.05,
+    midroll_z_max: float = 0.10,
+    midroll_omega_range: tuple = (0.0, 3.0),
+    tuck_overrides: Optional[dict] = None,
+    tuck_factor_range: tuple = (0.3, 1.0),
+    joint_noise_std: float = 0.08,
+):
+    """Reset to a posture start (standing or seated) or a mid-roll state.
+
+    Buckets (reverse curriculum): STANDING at HOME just above the measured
+    equilibrium, SEATED at the sit keyframe (sitstand's stability-verified
+    SITTING_TARGET_OVERRIDES), MID-ROLL — tucked, rotated partway about the
+    body's FORWARD (x) axis in the COMMANDED direction, with lateral angular
+    momentum — and (from the curriculum) CROUCH-START: a slice of the standing
+    bucket born at the sit-keyframe crouch with the landing gate PRE-OPENED,
+    i.e. episodes that start exactly at the "roll complete, now stand up"
+    frontier (the stand-target rise needs on-policy data there). The spawn
+    angle is applied to the Euler ROLL component to match the ω_x
+    accumulator.
+
+    The task is POSTURE-PRESERVING with a two-button command: the episode's
+    landing posture comes from the SPAWN (stand bucket → STAND, seated →
+    SIT — recorded in ``env._side_roll_posture``), not from the command; the
+    policy infers it from proprioception. Mid-roll spawns sample the target
+    50/50 stand/sit (recorded deterministically per env): the target is not
+    observable from a tucked mid-roll state (reward variance PPO handles
+    natively), and the stand-target half RESTORES the roulade's crouch→stand
+    bootstrap — spawns past ~300° open the landing gate at birth and pay only
+    if the duck RISES, which is the on-policy data the rise-from-crouch last
+    mile needs. (An earlier design paid mid-roll spawns max(stand, sit)
+    scores; it neutralized exactly that pressure — the policy learned to rest
+    at sit height after every roll. Caught by the 3000-iteration eval: final
+    trunk z pinned at 0.062 across ALL spawn postures for 1500 iterations.)
+
+    This event is also the SOURCE OF TRUTH for the episode's button: it
+    samples it (±1, 50/50) and stores [0, btn, 0] in
+    ``env._side_roll_spawn_cmd`` — SideRollCommand.compute() forces it onto
+    the live command on the first step after reset (mjlab resets events
+    BEFORE the command manager, so writing vel_command_b here would be
+    clobbered).
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    num = len(env_ids)
+    asset: Entity = env.scene[asset_cfg.name]
+    accum, max_accum, paid = _side_roll_state(env)
+
+    total = standing_prob + seated_prob + midroll_prob
+    p_stand = standing_prob / max(total, 1e-6)
+    p_seat = (standing_prob + seated_prob) / max(total, 1e-6)
+    u = torch.rand(num, device=env.device)
+    is_stand = u < p_stand
+    is_seat = (u >= p_stand) & (u < p_seat)
+    is_mid = u >= p_seat
+
+    # CROUCH-START reverse curriculum: a slice of the STANDING bucket spawns
+    # at a RANDOM DEPTH of the crouch→stand rise (z from the sit rest up to
+    # standing height, joint pose lerped HOME→sit-keyframe to match), with
+    # the landing gate PRE-OPENED (latch set, frontier pre-set to 2π) —
+    # episodes born all along the "roll complete, now stand up" trajectory.
+    # Single-depth (sit-keyframe) crouch starts did NOT produce the rise in
+    # 1400 iterations (final z pinned at 0.062, eval 2026-10-03): the motor
+    # skill needs on-policy data at EVERY depth, the velstand run-5
+    # crouch-basin lesson. Training-only spawn — deployment never sees it.
+    if crouch_start_prob > 0.0:
+        is_crouch = is_stand & (torch.rand(num, device=env.device) < crouch_start_prob)
+        is_stand = is_stand & ~is_crouch
+    else:
+        is_crouch = torch.zeros_like(is_stand)
+    low_spawn = is_seat | is_crouch
+
+    # Sample the episode's button (±1, 50/50) — the event owns the command
+    # for this episode — and record the spawn's landing posture: stand ⇒ 0,
+    # seated ⇒ 1, mid-roll ⇒ 50/50 deterministic sample (stand-target half
+    # keeps the crouch→stand bootstrap alive; see the docstring war story).
+    direction = torch.where(
+        torch.rand(num, device=env.device) < 0.5,
+        torch.full_like(u, -1.0),
+        torch.full_like(u, 1.0),
+    )
+    mid_target = (torch.rand(num, device=env.device) < 0.5).float()
+    posture = torch.where(
+        is_seat,
+        torch.ones_like(u),
+        torch.where(is_mid, mid_target, torch.zeros_like(u)),
+    )
+    _side_roll_posture(env)[env_ids] = posture
+    if not hasattr(env, "_side_roll_spawn_cmd"):
+        env._side_roll_spawn_cmd = torch.zeros(env.num_envs, 3, device=env.device)
+    env._side_roll_spawn_cmd[env_ids, 0] = 0.0
+    env._side_roll_spawn_cmd[env_ids, 1] = direction
+    env._side_roll_spawn_cmd[env_ids, 2] = 0.0
+
+    yaw = torch.rand(num, device=env.device) * 2 * np.pi - np.pi
+    cy = torch.cos(yaw * 0.5)
+    sy = torch.sin(yaw * 0.5)
+
+    # Side-roll spawn orientation. The lateral roll rotates about the body's
+    # FORWARD (x) axis, which is the Euler ROLL component (not pitch — pitch
+    # would be a forward/roulade rotation). The reverse-curriculum angle (spawn
+    # part-way over the side) goes into `roll`, SIGNED by the commanded
+    # direction; standing/seated spawns keep a small roll/pitch noise. This
+    # must match the accumulator axis (ω_x) or the spawn orientation won't be
+    # on the side and the accumulator can't pick it up (caught in smoke test:
+    # spawns were coming out nearly-upright, lateral_axis_z≈0).
+    mid_roll = (
+        torch.rand(num, device=env.device) * (midroll_pitch_max - midroll_pitch_min)
+        + midroll_pitch_min
+    )
+    roll = torch.where(is_mid, direction * mid_roll, torch.zeros_like(mid_roll))
+    # small tilt noise on the rest buckets (±standing_tilt or ±5° stand,
+    # ±sitting_tilt seated — the sitstand convention).
+    tilt = torch.where(
+        low_spawn,
+        torch.full_like(mid_roll, max(sitting_tilt_max, 1e-6)),
+        torch.full_like(mid_roll, max(standing_tilt_max, math.radians(5.0))),
+    )
+    roll = roll + (torch.rand(num, device=env.device) * 2 - 1) * tilt
+    pitch = (torch.rand(num, device=env.device) * 2 - 1) * tilt
+
+    cp = torch.cos(pitch * 0.5); sp = torch.sin(pitch * 0.5)
+    cr = torch.cos(roll * 0.5); sr = torch.sin(roll * 0.5)
+    # ZYX intrinsic Euler → quaternion (yaw * pitch * roll), as in roulade.
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * cp * sy
+    quat = torch.stack([qw, qx, qy, qz], dim=1)
+
+    def _uni(lo: float, hi: float) -> torch.Tensor:
+        return torch.rand(num, device=env.device) * (hi - lo) + lo
+
+    z_stand = _uni(standing_z_min, standing_z_max)
+    z_seat = _uni(sitting_z_min, sitting_z_max)
+    z_mid = _uni(midroll_z_min, midroll_z_max)
+    # crouch-start: any depth along the rise (deep = sit-keyframe crouch,
+    # shallow = nearly standing); the joint lerp below follows the same depth
+    z_crouch = _uni(sitting_z_min, standing_z_min)
+    new_z = torch.where(
+        is_mid, z_mid, torch.where(is_crouch, z_crouch, torch.where(is_seat, z_seat, z_stand))
+    )
+
+    env.sim.data.qpos[env_ids, 2] = new_z + _env_origin_z(env, env_ids)
+    env.sim.data.qpos[env_ids, 3:7] = quat
+    env.sim.data.qvel[env_ids, :6] = 0.0
+
+    servo_ids = _servo_joint_ids(env, asset)
+    cols = torch.tensor([7 + j for j in servo_ids], device=env.device, dtype=torch.long)
+
+    # Seated bucket AND crouch-start slice: lerp HOME → sit keyframe + joint
+    # noise, as the sitstand ground-state reset does. Crouch-start envs lerp
+    # by their SPAWN DEPTH (deep z → full sit keyframe, shallow z → near
+    # HOME) so the pose is kinematically consistent with the height.
+    seat_env_ids = env_ids[low_spawn]
+    if len(seat_env_ids) > 0 and sitting_joint_overrides:
+        depth = (
+            new_z[low_spawn] - sitting_z_min
+        ) / max(standing_z_min - sitting_z_min, 1e-6)
+        u_seat = torch.where(
+            is_crouch[low_spawn],
+            (1.0 - depth).clamp(0.0, 1.0),
+            torch.rand(len(seat_env_ids), device=env.device) * 0.15 + 0.85,
+        )
+        for jnt_idx, angle in sitting_joint_overrides.items():
+            col = 7 + servo_ids[jnt_idx]
+            home = env.sim.data.qpos[seat_env_ids, col]
+            env.sim.data.qpos[seat_env_ids, col] = home + u_seat * (angle - home)
+        if sitting_joint_noise_std > 0.0:
+            noise = (
+                torch.randn(len(seat_env_ids), len(cols), device=env.device)
+                * sitting_joint_noise_std
+            )
+            env.sim.data.qpos[seat_env_ids.unsqueeze(1), cols.unsqueeze(0)] += noise
+
+    # Mid-roll bucket: lerp HOME → tuck by a per-env factor + joint noise.
+    mid_env_ids = env_ids[is_mid]
+    if len(mid_env_ids) > 0 and tuck_overrides:
+        u_t = (
+            torch.rand(len(mid_env_ids), device=env.device)
+            * (tuck_factor_range[1] - tuck_factor_range[0])
+            + tuck_factor_range[0]
+        )
+        for jnt_idx, angle in tuck_overrides.items():
+            col = 7 + servo_ids[jnt_idx]
+            home = env.sim.data.qpos[mid_env_ids, col]
+            env.sim.data.qpos[mid_env_ids, col] = home + u_t * (angle - home)
+    if len(mid_env_ids) > 0 and joint_noise_std > 0.0:
+        noise = torch.randn(len(mid_env_ids), len(cols), device=env.device) * joint_noise_std
+        env.sim.data.qpos[mid_env_ids.unsqueeze(1), cols.unsqueeze(0)] += noise
+
+    # Mid-roll angular momentum about the body x (forward) axis. free-joint
+    # qvel[3:6] is the angular velocity in the BODY frame (verified in the
+    # roulade smoke test), so index 3 is the roll axis regardless of spawn
+    # yaw; the commanded direction sets the handedness.
+    if len(mid_env_ids) > 0 and midroll_omega_range[1] > 0.0:
+        omega = (
+            torch.rand(len(mid_env_ids), device=env.device)
+            * (midroll_omega_range[1] - midroll_omega_range[0])
+            + midroll_omega_range[0]
+        )
+        env.sim.data.qvel[mid_env_ids, 3] = (
+            direction[is_mid] * _SIDEROLL_SIGN * omega
+        )
+
+    # Élan hook: forward base velocity for standing spawns (mapped through yaw).
+    stand_env_ids = env_ids[is_stand]
+    if len(stand_env_ids) > 0 and forward_vel_range[1] > 0.0:
+        vx = (
+            torch.rand(len(stand_env_ids), device=env.device)
+            * (forward_vel_range[1] - forward_vel_range[0])
+            + forward_vel_range[0]
+        )
+        yaw_s = yaw[is_stand]
+        env.sim.data.qvel[stand_env_ids, 0] = vx * torch.cos(yaw_s)
+        env.sim.data.qvel[stand_env_ids, 1] = vx * torch.sin(yaw_s)
+
+    # Progress accounting: rest spawns at 0, mid-roll at the spawn angle,
+    # CROUCH-START at 2π — the landing gate is born fully open (the "roll is
+    # done" premise); paid is pre-set too, so no free progress payments.
+    spawn_angle = torch.where(
+        is_mid,
+        mid_roll,
+        torch.where(is_crouch, torch.full_like(mid_roll, 2 * math.pi), torch.zeros_like(mid_roll)),
+    )
+    accum[env_ids] = spawn_angle
+    max_accum[env_ids] = spawn_angle
+    paid[env_ids] = spawn_angle
+    # Side latch: mid-roll spawns and crouch-start spawns are born past the
+    # pivot (reverse curriculum teaches the LAST mile); stand/seated spawns
+    # must earn it by actually rolling.
+    env._side_roll_side_latch[env_ids] = is_mid | is_crouch
+
+
+def side_roll_progress(
+    env: ManagerBasedRlEnv,
+    target_angle: float = 2 * math.pi,
+    max_paid_rate: float = 5.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay increments of the side-roll progress frontier (≤ one full lateral roll)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_side_roll_accum(env, asset)
+    _, max_accum, paid = _side_roll_state(env)
+    new_paid = torch.clamp(max_accum, max=target_angle)
+    delta = torch.clamp(new_paid - torch.clamp(paid, max=target_angle), min=0.0)
+    delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
+    env._side_roll_paid = torch.maximum(paid, new_paid)
+    return delta / (env.step_dt * target_angle)
+
+
+def side_roll_overspeed_penalty(
+    env: ManagerBasedRlEnv,
+    omega_max: float = 7.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """max(0, |ω_x| − omega_max)² — quadratic tax on whip-speed side rotation."""
+    asset: Entity = env.scene[asset_cfg.name]
+    omega_x = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 0], nan=0.0)
+    excess = torch.clamp(omega_x.abs() - omega_max, min=0.0)
+    return excess.pow(2)
+
+
+def side_roll_flatness_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """(forward-axis world-z)² — dense gradient toward a clean lateral roll."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(_forward_axis_z(asset.data.root_link_quat_w), nan=0.0).pow(2)
+
+
+def side_roll_sagittal_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Rotation out of the lateral-roll plane: ω_y² + ω_z² (positive; use negative weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    omega_b = asset.data.root_link_ang_vel_b
+    return torch.nan_to_num(omega_b[:, 1].pow(2) + omega_b[:, 2].pow(2), nan=0.0)
+
+
+def side_roll_forward_velocity_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Body-frame forward (x) linear velocity² — keeps the lateral roll straight."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 0].pow(2), nan=0.0)
+
+
+def _side_roll_rest_composite(
+    env: ManagerBasedRlEnv,
+    asset: Entity,
+    sit_overrides: dict,
+    joint_indices: list,
+    stand_z: float,
+    sit_z: float,
+    height_std: float,
+    pose_std: float,
+) -> torch.Tensor:
+    """Multiplicative rest score (height Gaussian × pose Gaussian) evaluated
+    against BOTH rest targets, selected per env by the spawn posture
+    (STAND envs vs HOME/stand_z, SIT envs vs the keyframe/sit_z, EITHER
+    mid-roll envs take the max — either rest is a valid landing)."""
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+    stand_target = _servo_default_joint_pos(env, asset)
+    sit_target = stand_target.clone()
+    for idx, val in sit_overrides.items():
+        sit_target[:, idx] = val
+    joint_pos = _servo_joint_pos(env, asset)[:, joint_indices]
+
+    def _score(target_z: float, target_pose: torch.Tensor) -> torch.Tensor:
+        height_g = torch.exp(-((z - target_z) / height_std) ** 2)
+        pose_err_sq = ((joint_pos - target_pose[:, joint_indices]) ** 2).mean(dim=-1)
+        pose_g = torch.exp(-pose_err_sq / (pose_std * pose_std))
+        return height_g * pose_g
+
+    return _posture_pick(
+        _side_roll_posture(env),
+        _score(stand_z, stand_target),
+        _score(sit_z, sit_target),
+    )
+
+
+def side_roll_landing_composite(
+    env: ManagerBasedRlEnv,
+    sit_overrides: dict,
+    joint_indices: list,
+    stand_z: float,
+    sit_z: float,
+    height_std: float = 0.04,
+    upright_std: float = 0.40,
+    pose_std: float = 0.40,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Rest composite (upright × height × pose vs the SPAWN's posture) ×
+    completion gate.
+
+    The landing annuity is posture-preserving WITHOUT a posture command: envs
+    spawned STANDING land at HOME/stand_z, envs spawned SEATED at the sit
+    keyframe/sit_z (the policy infers the start posture from proprioception);
+    mid-roll spawns pay either rest (max)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_side_roll_accum(env, asset)
+    quat = asset.data.root_link_quat_w
+    tilt_sq = 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+    upright = torch.exp(-tilt_sq / (upright_std * upright_std))
+    score = _side_roll_rest_composite(
+        env, asset, sit_overrides, joint_indices, stand_z, sit_z,
+        height_std, pose_std,
+    )
+    return score * upright * _side_roll_completion_gate(
+        env, gate_lo, gate_hi, require_side=True
+    )
+
+
+def _side_roll_rest_height(
+    env: ManagerBasedRlEnv,
+    asset: Entity,
+    stand_z: float,
+    sit_z: float,
+    std: float,
+) -> torch.Tensor:
+    """Height Gaussian vs BOTH rest heights, spawn-posture-selected (EITHER
+    takes the max)."""
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+    return _posture_pick(
+        _side_roll_posture(env),
+        torch.exp(-((z - stand_z) / std) ** 2),
+        torch.exp(-((z - sit_z) / std) ** 2),
+    )
+
+
+def side_roll_upright_after_roll(
+    env: ManagerBasedRlEnv,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Linear cos(tilt) × completion gate — bootstrap pull back toward vertical."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_side_roll_accum(env, asset)
+    quat = asset.data.root_link_quat_w
+    upright = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    return torch.clamp(upright, min=0.0) * _side_roll_completion_gate(
+        env, gate_lo, gate_hi, require_side=True
+    )
+
+
+def side_roll_height_after_roll(
+    env: ManagerBasedRlEnv,
+    stand_z: float,
+    sit_z: float,
+    std: float = 0.04,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Broad height Gaussian vs the SPAWN posture's height × completion gate."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_side_roll_accum(env, asset)
+    return _side_roll_rest_height(env, asset, stand_z, sit_z, std) * (
+        _side_roll_completion_gate(env, gate_lo, gate_hi, require_side=True)
+    )
+
+
+def side_roll_landing_sharp(
+    env: ManagerBasedRlEnv,
+    stand_z: float,
+    sit_z: float,
+    height_std: float = 0.015,
+    upright_std: float = 0.3,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Tight-std upright × height (spawn posture) × gate — the last mile."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_side_roll_accum(env, asset)
+    quat = asset.data.root_link_quat_w
+    tilt_sq = 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    upright_g = torch.exp(-tilt_sq / (upright_std * upright_std))
+    height_g = _side_roll_rest_height(env, asset, stand_z, sit_z, height_std)
+    gate = _side_roll_completion_gate(env, gate_lo, gate_hi, require_side=True)
+    return upright_g * height_g * gate
+
+
+def side_roll_stand_tax(
+    env: ManagerBasedRlEnv,
+    stand_z: float,
+    sit_z: float,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """SELF-NEGATING height L1 below the SPAWN posture's rest height, post-gate.
+
+    EITHER (mid-roll) envs are charged against the easier target (max of two
+    taxes) — from a mid-roll state either rest is a valid landing."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_side_roll_accum(env, asset)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    tax = _posture_pick(
+        _side_roll_posture(env),
+        -torch.clamp(stand_z - z, min=0.0),
+        -torch.clamp(sit_z - z, min=0.0),
+    )
+    return tax * _side_roll_completion_gate(env, gate_lo, gate_hi, require_side=True)
+
+
+def side_roll_rise_velocity(
+    env: ManagerBasedRlEnv,
+    stand_z: float,
+    sit_z: float,
+    margin: float = 0.01,
+    gate_lo: float = math.radians(180.0),
+    gate_hi: float = math.radians(260.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """CoM upward velocity × late-roll gate — bootstrap the exit rise.
+
+    The height cap is spawn-posture-selected (SIT envs need rise only to
+    sitting); EITHER envs use the higher cap (rising toward either rest pays).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_side_roll_accum(env, asset)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
+    reward = torch.clamp(vz, min=0.0)
+    cap = _posture_pick(
+        _side_roll_posture(env),
+        torch.full_like(z, stand_z + margin),
+        torch.full_like(z, sit_z + margin),
+    )
+    reward = reward * (z < cap).float()
+    return reward * _side_roll_completion_gate(env, gate_lo, gate_hi, require_side=True)

@@ -75,6 +75,10 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_side_roll_env_cfg import (
+    make_microduck_side_roll_env_cfg,
+    MicroduckSideRollRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -230,6 +234,16 @@ register_mjlab_task(
     env_cfg=make_microduck_roulade_env_cfg(),
     play_env_cfg=make_microduck_roulade_env_cfg(play=True),
     rl_cfg=MicroduckRouladeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# SideRoll — lateral roll over the shoulder/trunk, land back on the feet.
+# Bilateral double-flip: symmetry mirror-loss lets one policy do left AND right.
+register_mjlab_task(
+    task_id="Mjlab-SideRoll-Flat-MicroDuck",
+    env_cfg=make_microduck_side_roll_env_cfg(),
+    play_env_cfg=make_microduck_side_roll_env_cfg(play=True),
+    rl_cfg=MicroduckSideRollRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
