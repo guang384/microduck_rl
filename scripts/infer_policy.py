@@ -10,14 +10,20 @@ import pickle
 import queue
 import select
 import sys
-import termios
 import threading
 import time
-import tty
 import numpy as np
 import mujoco
 import mujoco.viewer
 import onnxruntime as ort
+
+try:
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:  # Windows: no POSIX terminal control; keyboard disabled
+    termios = tty = None
+    _HAS_TERMIOS = False
 
 MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_ramps.xml"
@@ -156,14 +162,14 @@ class TerminalInput:
 
     def __init__(self):
         self._queue = queue.Queue()
-        self.enabled = sys.stdin.isatty()
+        self.enabled = sys.stdin.isatty() and _HAS_TERMIOS
         self._fd = sys.stdin.fileno() if self.enabled else -1
         self._old_attrs = None
         self._stop = threading.Event()
 
     def __enter__(self):
         if not self.enabled:
-            print("WARNING: stdin is not a TTY — keyboard control disabled")
+            print("WARNING: keyboard control disabled (no TTY or no termios on this platform)")
             return self
         self._old_attrs = termios.tcgetattr(self._fd)
         tty.setcbreak(self._fd)

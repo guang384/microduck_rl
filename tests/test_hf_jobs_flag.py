@@ -76,7 +76,9 @@ def test_train_on_path_is_a_mjlab_trainer():
         "no `train` on PATH — the venv script was uninstalled and not recreated; "
         "run `uv sync --reinstall-package mjlab-microduck`."
     )
-    head = Path(exe).read_bytes()[:8192]
+    # Whole file: Windows's uv exe embeds its target past 8 KB (Linux's shebang
+    # carries it); an unrelated binary (liblinear's `train`) has b"mjlab" nowhere.
+    head = Path(exe).read_bytes()
     assert b"mjlab" in head, (
         f"`train` resolves to {exe}, which is not a mjlab trainer. bin/train was "
         "uninstalled and this is an unrelated binary from PATH."
