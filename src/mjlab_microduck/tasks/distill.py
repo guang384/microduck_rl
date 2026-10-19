@@ -234,7 +234,9 @@ def _resolve_checkpoint(bc_cfg: dict, prefix: str = "") -> Path | None:
         return None
     from mjlab.utils.os import get_wandb_checkpoint_path
 
-    path, cached = get_wandb_checkpoint_path(EXPERT_CACHE_DIR, Path(run), bc_cfg.get(f"{prefix}checkpoint_name"))
+    # Plain string, NOT Path(): WindowsPath stringifies with backslashes and
+    # wandb's run lookup then 404s (mjlab only str()s and split("/")s it).
+    path, cached = get_wandb_checkpoint_path(EXPERT_CACHE_DIR, run, bc_cfg.get(f"{prefix}checkpoint_name"))
     print(f"[distill] {prefix or 'expert_'}checkpoint {path} ({'cached' if cached else 'downloaded'})")
     return path
 
